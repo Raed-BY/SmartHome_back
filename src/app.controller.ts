@@ -14,15 +14,18 @@ import { Sensor } from './sensor.schema';
 @Controller('smarthome')
 export class AppController {
   private currentUserName = 'Guest';
+  private manualPumpState = false;
+  private manualCanopyState = false;
+  private garageOpen = false;
+  private proximityEnabled = true;
+  private lastManualCloseTime = 0; // The 60-second safety timer
 
-  private currentLights = {
+  private currentLights: Record<string, boolean> = {
     'Living Room': false,
     Bedroom: false,
     Kitchen: false,
     Garage: false,
   };
-
-  private manualPumpState = false;
 
   constructor(
     @InjectModel(User.name) private userModel: Model<User>,
@@ -30,7 +33,7 @@ export class AppController {
   ) {}
 
   @Post('login')
-  async login(@Body() body: any) {
+  async login(@Body() body: { email: string; pass: string }) {
     const user = await this.userModel.findOne({
       email: body.email,
       pass: body.pass,
@@ -43,15 +46,14 @@ export class AppController {
   }
 
   @Post('signup')
-  async signup(@Body() body: any) {
+  async signup(@Body() body: { name: string; email: string; pass: string }) {
     try {
       const newUser = new this.userModel(body);
       await newUser.save();
       return { success: true };
-    } catch (error) {
-      if (error.code === 11000) {
-        throw new ConflictException('Email already exists');
-      }
+    } catch (error: any) {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      if (error.code === 11000) throw new ConflictException('Email exists');
       throw error;
     }
   }
@@ -59,6 +61,7 @@ export class AppController {
   @Get('status')
   async getStatus() {
     const latestData = await this.sensorModel.findOne().sort({ timestamp: -1 });
+    const userCount = await this.userModel.countDocuments();
     return {
       tempSalon: latestData?.tempSalon ?? 0,
       soilMoisture: latestData?.soilMoisture ?? 0,
@@ -66,10 +69,15 @@ export class AppController {
       isRaining: latestData?.isRaining ?? false,
       motionDetected: latestData?.motionDetected ?? false,
       manualPump: this.manualPumpState,
+      manualCanopy: this.manualCanopyState,
+      garageOpen: this.garageOpen,
+      proximityEnabled: this.proximityEnabled,
+      lastManualCloseTime: this.lastManualCloseTime,
       lights: this.currentLights,
       systemInfo: {
         userName: this.currentUserName,
-        version: '1.2.0',
+        familyMembers: userCount,
+        version: '2.0.0',
         deviceModel: 'ESP32-S3',
         wifiStatus: 'Connected',
         serverIP: '192.168.1.7',
@@ -79,24 +87,47 @@ export class AppController {
 
   @Post('update')
   async updateStatus(@Body() newData: any) {
-    const dataToSave = { ...newData, manualPump: this.manualPumpState };
-    const dataEntry = new this.sensorModel(dataToSave);
+    const dataEntry = new this.sensorModel({
+      ...newData,
+      manualPump: this.manualPumpState,
+    });
     await dataEntry.save();
     return { success: true };
   }
 
   @Post('toggle-pump')
-  async togglePump(@Body() body: { state: boolean }) {
+  togglePump(@Body() body: { state: boolean }) {
     this.manualPumpState = body.state;
     return { success: true };
   }
 
-  @Post('toggle-light')
-  async toggleLight(@Body() body: { name: string; state: boolean }) {
-    if (this.currentLights.hasOwnProperty(body.name)) {
-      this.currentLights[body.name] = body.state;
-      return { success: true };
+  @Post('toggle-canopy')
+  toggleCanopy(@Body() body: { state: boolean }) {
+    this.manualCanopyState = body.state;
+    return { success: true };
+  }
+
+  @Post('toggle-garage')
+  toggleGarage(@Body() body: { state: boolean }) {
+    this.garageOpen = body.state;
+    // IF CLOSING: Record the time for the 60-second Bluetooth mute
+    if (body.state === false) {
+      this.lastManualCloseTime = Date.now();
     }
-    return { success: false };
+    return { success: true };
+  }
+
+  @Post('toggle-light')
+  toggleLight(@Body() body: { name: string; state: boolean }) {
+    if (body.name in this.currentLights) {
+      this.currentLights[body.name] = body.state;
+    }
+    return { success: true };
+  }
+
+  @Post('toggle-proximity')
+  toggleProximity(@Body() body: { state: boolean }) {
+    this.proximityEnabled = body.state;
+    return { success: true };
   }
 }
