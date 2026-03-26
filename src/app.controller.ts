@@ -5,20 +5,30 @@ import {
   Body,
   UnauthorizedException,
   ConflictException,
+  BadRequestException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { User } from './user.schema';
 import { Sensor } from './sensor.schema';
 
+interface SensorUpdateDto {
+  tempSalon?: number;
+  soilMoisture?: number;
+  gasLevel?: number;
+  isRaining?: boolean;
+  motionDetected?: boolean;
+}
+
 @Controller('smarthome')
 export class AppController {
   private currentUserName = 'Guest';
+  private currentUserEmail = '';
   private manualPumpState = false;
   private manualCanopyState = false;
   private garageOpen = false;
   private proximityEnabled = true;
-  private lastManualCloseTime = 0; // The 60-second safety timer
+  private lastManualCloseTime = 0;
 
   private currentLights: Record<string, boolean> = {
     'Living Room': false,
@@ -38,8 +48,10 @@ export class AppController {
       email: body.email,
       pass: body.pass,
     });
+
     if (user) {
       this.currentUserName = user.name;
+      this.currentUserEmail = user.email;
       return { success: true, name: user.name };
     }
     throw new UnauthorizedException('Invalid credentials');
@@ -47,21 +59,43 @@ export class AppController {
 
   @Post('signup')
   async signup(@Body() body: { name: string; email: string; pass: string }) {
+    if (!body.email.includes('@') || !body.email.endsWith('.com')) {
+      throw new BadRequestException('Invalid email format');
+    }
+    if (body.pass.length < 6) {
+      throw new BadRequestException('Password too short');
+    }
+
     try {
       const newUser = new this.userModel(body);
       await newUser.save();
       return { success: true };
     } catch (error: any) {
       // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-      if (error.code === 11000) throw new ConflictException('Email exists');
+      if (error.code === 11000) {
+        throw new ConflictException('Email already exists');
+      }
       throw error;
     }
+  }
+
+  @Post('change-password')
+  async changePassword(@Body() body: { newPass: string }) {
+    if (body.newPass.length < 6) {
+      throw new BadRequestException('New password too short');
+    }
+    await this.userModel.updateOne(
+      { email: this.currentUserEmail },
+      { pass: body.newPass },
+    );
+    return { success: true };
   }
 
   @Get('status')
   async getStatus() {
     const latestData = await this.sensorModel.findOne().sort({ timestamp: -1 });
     const userCount = await this.userModel.countDocuments();
+
     return {
       tempSalon: latestData?.tempSalon ?? 0,
       soilMoisture: latestData?.soilMoisture ?? 0,
@@ -70,14 +104,14 @@ export class AppController {
       motionDetected: latestData?.motionDetected ?? false,
       manualPump: this.manualPumpState,
       manualCanopy: this.manualCanopyState,
+      lights: this.currentLights,
       garageOpen: this.garageOpen,
       proximityEnabled: this.proximityEnabled,
       lastManualCloseTime: this.lastManualCloseTime,
-      lights: this.currentLights,
       systemInfo: {
         userName: this.currentUserName,
         familyMembers: userCount,
-        version: '2.0.0',
+        version: '2.1.5',
         deviceModel: 'ESP32-S3',
         wifiStatus: 'Connected',
         serverIP: '192.168.1.7',
@@ -86,11 +120,12 @@ export class AppController {
   }
 
   @Post('update')
-  async updateStatus(@Body() newData: any) {
-    const dataEntry = new this.sensorModel({
+  async updateStatus(@Body() newData: SensorUpdateDto) {
+    const dataToSave = {
       ...newData,
       manualPump: this.manualPumpState,
-    });
+    };
+    const dataEntry = new this.sensorModel(dataToSave);
     await dataEntry.save();
     return { success: true };
   }
@@ -110,7 +145,6 @@ export class AppController {
   @Post('toggle-garage')
   toggleGarage(@Body() body: { state: boolean }) {
     this.garageOpen = body.state;
-    // IF CLOSING: Record the time for the 60-second Bluetooth mute
     if (body.state === false) {
       this.lastManualCloseTime = Date.now();
     }
@@ -121,13 +155,20 @@ export class AppController {
   toggleLight(@Body() body: { name: string; state: boolean }) {
     if (body.name in this.currentLights) {
       this.currentLights[body.name] = body.state;
+      return { success: true };
     }
-    return { success: true };
+    return { success: false };
   }
 
   @Post('toggle-proximity')
   toggleProximity(@Body() body: { state: boolean }) {
     this.proximityEnabled = body.state;
+    return { success: true };
+  }
+
+  @Post('update-garage-status')
+  updateGarage(@Body() body: { open: boolean }) {
+    this.garageOpen = body.open;
     return { success: true };
   }
 }
