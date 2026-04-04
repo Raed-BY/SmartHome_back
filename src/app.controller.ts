@@ -3,12 +3,14 @@ import {
   Get,
   Post,
   Body,
+  Req,
   UnauthorizedException,
   ConflictException,
   BadRequestException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
+import type { Request } from 'express';
 import { User } from './user.schema';
 import { Sensor } from './sensor.schema';
 
@@ -29,6 +31,8 @@ export class AppController {
   private garageOpen = false;
   private proximityEnabled = true;
   private lastManualCloseTime = 0;
+  private readonly activeClients = new Map<string, number>();
+  private readonly activeWindowMs = 15_000;
 
   private currentLights: Record<string, boolean> = {
     'Living Room': false,
@@ -41,6 +45,19 @@ export class AppController {
     @InjectModel(User.name) private userModel: Model<User>,
     @InjectModel(Sensor.name) private sensorModel: Model<Sensor>,
   ) {}
+
+  private updateActiveClients(key: string) {
+    const now = Date.now();
+    this.activeClients.set(key, now);
+
+    for (const [clientKey, lastSeen] of this.activeClients.entries()) {
+      if (now - lastSeen > this.activeWindowMs) {
+        this.activeClients.delete(clientKey);
+      }
+    }
+
+    return this.activeClients.size;
+  }
 
   @Post('login')
   async login(@Body() body: { email: string; pass: string }) {
@@ -92,9 +109,15 @@ export class AppController {
   }
 
   @Get('status')
-  async getStatus() {
+  async getStatus(@Req() req: Request) {
     const latestData = await this.sensorModel.findOne().sort({ timestamp: -1 });
     const userCount = await this.userModel.countDocuments();
+    const clientIdHeader = req.headers['x-client-id'];
+    const clientId: string =
+      typeof clientIdHeader === 'string' && clientIdHeader.trim().length > 0
+        ? clientIdHeader.trim()
+        : (req.ip ?? 'unknown-client');
+    const activeMembers = this.updateActiveClients(clientId);
 
     return {
       tempSalon: latestData?.tempSalon ?? 0,
@@ -110,6 +133,7 @@ export class AppController {
       lastManualCloseTime: this.lastManualCloseTime,
       systemInfo: {
         userName: this.currentUserName,
+        activeMembers,
         familyMembers: userCount,
         version: '2.1.5',
         deviceModel: 'ESP32-S3',

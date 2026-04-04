@@ -1,6 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { describe, it, expect, beforeEach, jest } from '@jest/globals';
 import { AppController } from './app.controller';
 import { getModelToken } from '@nestjs/mongoose';
+import type { Request } from 'express';
 import { User } from './user.schema';
 import { Sensor } from './sensor.schema';
 
@@ -11,12 +13,15 @@ describe('AppController', () => {
   const mockUserModel = {
     findOne: jest.fn(),
     save: jest.fn(),
+    countDocuments: jest.fn().mockResolvedValue(1),
   };
 
   const mockSensorModel = {
     findOne: jest.fn().mockReturnValue({
       sort: jest.fn().mockReturnValue({
-        exec: jest.fn().mockResolvedValue({ tempSalon: 25 }),
+        exec: jest
+          .fn<() => Promise<{ tempSalon: number }>>()
+          .mockResolvedValue({ tempSalon: 25 }),
       }),
     }),
     save: jest.fn(),
@@ -47,7 +52,10 @@ describe('AppController', () => {
 
   describe('getStatus', () => {
     it('should return system status', async () => {
-      const status = await appController.getStatus();
+      const status = await appController.getStatus({
+        headers: {},
+        ip: '127.0.0.1',
+      } as Request);
       expect(status).toHaveProperty('systemInfo');
       expect(status.systemInfo.userName).toBe('Guest');
     });
