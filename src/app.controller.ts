@@ -11,8 +11,16 @@ import {
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import type { Request } from 'express';
+import {
+  Client,
+  ClientProxy,
+  MessagePattern,
+  Payload,
+  Transport,
+} from '@nestjs/microservices';
 import { User } from './user.schema';
 import { Sensor } from './sensor.schema';
+import { decryptDoorbellPayload, getEncryptionKeyFromEnv } from './doorbell.crypto';
 
 interface SensorUpdateDto {
   tempSalon?: number;
@@ -24,6 +32,12 @@ interface SensorUpdateDto {
 
 @Controller('smarthome')
 export class AppController {
+  @Client({
+    transport: Transport.MQTT,
+    options: { url: 'mqtt://localhost:1883' },
+  })
+  mqttClient!: ClientProxy;
+
   private currentUserName = 'Guest';
   private currentUserEmail = '';
   private manualPumpState = false;
@@ -31,6 +45,8 @@ export class AppController {
   private garageOpen = false;
   private proximityEnabled = true;
   private lastManualCloseTime = 0;
+  private motionDetected = false;
+  private lastVisitor = 'No one at the door';
   private readonly activeClients = new Map<string, number>();
   private readonly activeWindowMs = 15_000;
 
@@ -108,6 +124,45 @@ export class AppController {
     return { success: true };
   }
 
+  @MessagePattern('home/doorbell')
+  handleDoorbell(@Payload() data: string | { person?: string }) {
+    let person = 'unknown';
+
+    try {
+      // If payload is a string, it's encrypted
+      if (typeof data === 'string') {
+        const encryptionKey = getEncryptionKeyFromEnv();
+        if (encryptionKey) {
+          const decrypted = decryptDoorbellPayload(data, encryptionKey);
+          person = (decrypted.person?.trim().toLowerCase() ?? 'unknown');
+          console.log(`🔓 Doorbell decrypted: ${person} (confidence: ${decrypted.confidence})`);
+        } else {
+          console.warn('⚠️  Encrypted doorbell received but DOORBELL_ENCRYPTION_KEY not configured. Treating as unknown.');
+        }
+      } else {
+        // Fallback: handle unencrypted payload (for backward compatibility)
+        person = (data.person?.trim().toLowerCase() ?? 'unknown');
+      }
+    } catch (error) {
+      console.error('Doorbell payload processing failed:', error);
+      person = 'unknown';
+    }
+
+    this.motionDetected = true;
+    this.lastVisitor =
+      person === 'raed'
+        ? 'Raed is at the door'
+        : person === 'safa'
+          ? 'Safa is at the door'
+          : 'An unknown person is at the door';
+
+    return {
+      success: true,
+      motionDetected: this.motionDetected,
+      lastVisitor: this.lastVisitor,
+    };
+  }
+
   @Get('status')
   async getStatus(@Req() req: Request) {
     const latestData = await this.sensorModel.findOne().sort({ timestamp: -1 });
@@ -125,6 +180,7 @@ export class AppController {
       gasLevel: latestData?.gasLevel ?? 0,
       isRaining: latestData?.isRaining ?? false,
       motionDetected: latestData?.motionDetected ?? false,
+      lastVisitor: this.lastVisitor,
       manualPump: this.manualPumpState,
       manualCanopy: this.manualCanopyState,
       lights: this.currentLights,
@@ -193,6 +249,13 @@ export class AppController {
   @Post('update-garage-status')
   updateGarage(@Body() body: { open: boolean }) {
     this.garageOpen = body.open;
+    return { success: true };
+  }
+
+  @Post('reset-doorbell')
+  resetDoorbell() {
+    this.motionDetected = false;
+    this.lastVisitor = 'No one at the door';
     return { success: true };
   }
 }
