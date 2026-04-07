@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
 import { AppController } from './app.controller';
 import { getModelToken } from '@nestjs/mongoose';
+import { HttpService } from '@nestjs/axios';
 import type { Request } from 'express';
 import { User } from './user.schema';
 import { Sensor } from './sensor.schema';
@@ -13,7 +14,8 @@ describe('AppController', () => {
   const mockUserModel = {
     findOne: jest.fn(),
     save: jest.fn(),
-    countDocuments: jest.fn().mockResolvedValue(1),
+    countDocuments: jest.fn<() => Promise<number>>().mockResolvedValue(1),
+    updateOne: jest.fn(),
   };
 
   const mockSensorModel = {
@@ -25,6 +27,10 @@ describe('AppController', () => {
       }),
     }),
     save: jest.fn(),
+  };
+
+  const mockHttpService = {
+    get: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -39,6 +45,10 @@ describe('AppController', () => {
         {
           provide: getModelToken(Sensor.name),
           useValue: mockSensorModel,
+        },
+        {
+          provide: HttpService,
+          useValue: mockHttpService,
         },
       ],
     }).compile();
