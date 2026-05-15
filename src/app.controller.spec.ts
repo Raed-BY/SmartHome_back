@@ -1,16 +1,15 @@
-import { Test, TestingModule } from '@nestjs/testing';
+import { Test } from '@nestjs/testing';
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
 import { AppController } from './app.controller';
 import { getModelToken } from '@nestjs/mongoose';
 import { HttpService } from '@nestjs/axios';
-import type { Request } from 'express';
 import { User } from './user.schema';
 import { Sensor } from './sensor.schema';
+import { RfidCard } from './rfid-card.schema';
 
 describe('AppController', () => {
   let appController: AppController;
 
-  // Create fake versions of the database models
   const mockUserModel = {
     findOne: jest.fn(),
     save: jest.fn(),
@@ -26,7 +25,10 @@ describe('AppController', () => {
           .mockResolvedValue({ tempSalon: 25 }),
       }),
     }),
-    save: jest.fn(),
+  };
+
+  const mockRfidCardModel = {
+    findOne: jest.fn(),
   };
 
   const mockHttpService = {
@@ -34,10 +36,9 @@ describe('AppController', () => {
   };
 
   beforeEach(async () => {
-    const app: TestingModule = await Test.createTestingModule({
+    const app = await Test.createTestingModule({
       controllers: [AppController],
       providers: [
-        // We "provide" the fake models to the controller
         {
           provide: getModelToken(User.name),
           useValue: mockUserModel,
@@ -45,6 +46,10 @@ describe('AppController', () => {
         {
           provide: getModelToken(Sensor.name),
           useValue: mockSensorModel,
+        },
+        {
+          provide: getModelToken(RfidCard.name),
+          useValue: mockRfidCardModel,
         },
         {
           provide: HttpService,
@@ -60,14 +65,23 @@ describe('AppController', () => {
     expect(appController).toBeDefined();
   });
 
-  describe('getStatus', () => {
-    it('should return system status', async () => {
-      const status = await appController.getStatus({
-        headers: {},
-        ip: '127.0.0.1',
-      } as Request);
-      expect(status).toHaveProperty('systemInfo');
-      expect(status.systemInfo.userName).toBe('Guest');
+  it('should return system status', async () => {
+    const status = await appController.getStatus();
+    expect(status).toHaveProperty('systemInfo');
+    expect(status.systemInfo.userName).toBe('Raed');
+  });
+
+  it('should authorize active RFID cards by uid', async () => {
+    mockRfidCardModel.findOne.mockReturnValueOnce({
+      exec: jest.fn(() =>
+        Promise.resolve({ uid: 'A1B2C3', ownerName: 'Raed' }),
+      ),
     });
+
+    const result = await appController.authorizeRfid({ uid: 'a1b2c3' });
+
+    expect(result.authorized).toBe(true);
+    expect(result.uid).toBe('A1B2C3');
+    expect(result.ownerName).toBe('Raed');
   });
 });
