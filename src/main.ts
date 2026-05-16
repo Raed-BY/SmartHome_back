@@ -1,4 +1,8 @@
+import * as dotenv from 'dotenv';
+dotenv.config();
+
 import { NestFactory } from '@nestjs/core';
+import { Transport, MicroserviceOptions } from '@nestjs/microservices';
 import { AppModule } from './app.module';
 import * as bodyParser from 'body-parser';
 
@@ -8,35 +12,48 @@ async function bootstrap() {
   const host = process.env.HOST ?? '0.0.0.0';
   const port = Number(process.env.PORT ?? 3000);
 
+  // Connect MQTT microservice so @MessagePattern handlers receive Pi/ESP32 messages
+  app.connectMicroservice<MicroserviceOptions>({
+    transport: Transport.MQTT,
+    options: { url: process.env.MQTT_URL ?? 'mqtt://172.20.10.4:1883' },
+  });
+  await app.startAllMicroservices();
+
   // 1. Enable CORS so your iPhone and Browser can talk to the server
   app.enableCors();
 
   // 1b. Install body parsers with a verify hook so we can log raw bodies for debugging
-  app.use(bodyParser.json({
-    verify: (req: any, _res, buf) => {
-      try {
-        req.rawBody = buf.toString();
-      } catch (_) {
-        req.rawBody = undefined;
-      }
-    },
-  }));
-  app.use(bodyParser.urlencoded({
-    extended: true,
-    verify: (req: any, _res, buf) => {
-      try {
-        req.rawBody = buf.toString();
-      } catch (_) {
-        req.rawBody = undefined;
-      }
-    },
-  }));
+  app.use(
+    bodyParser.json({
+      verify: (req: any, _res, buf) => {
+        try {
+          req.rawBody = buf.toString();
+        } catch (_) {
+          req.rawBody = undefined;
+        }
+      },
+    }),
+  );
+  app.use(
+    bodyParser.urlencoded({
+      extended: true,
+      verify: (req: any, _res, buf) => {
+        try {
+          req.rawBody = buf.toString();
+        } catch (_) {
+          req.rawBody = undefined;
+        }
+      },
+    }),
+  );
 
   // 1c. Simple request logger to print raw bodies for debugging mobile POSTs
   app.use((req: any, _res: any, next: any) => {
-    console.log(`[REQ] ${req.method} ${req.url} rawBody=${
-      req.rawBody ? req.rawBody : '<empty>'
-    }`);
+    console.log(
+      `[REQ] ${req.method} ${req.url} rawBody=${
+        req.rawBody ? req.rawBody : '<empty>'
+      }`,
+    );
     next();
   });
 

@@ -10,15 +10,10 @@ import {
 } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { InjectModel } from '@nestjs/mongoose';
-import {
-  Client,
-  ClientProxy,
-  MessagePattern,
-  Payload,
-  Transport,
-} from '@nestjs/microservices';
+import { Client, ClientProxy, Transport } from '@nestjs/microservices';
 import { Model } from 'mongoose';
 import { firstValueFrom } from 'rxjs';
+import * as mqtt from 'mqtt';
 import {
   decryptDoorbellPayload,
   getEncryptionKeyFromEnv,
@@ -71,6 +66,12 @@ export class AppController implements OnModuleInit {
   private motionDetected = false;
   private motionClearTimer: NodeJS.Timeout | null = null;
   private lastVisitor = 'No one at the door';
+  // Doorbell event flag, INDEPENDENT of PIR motion so ESP32 updates cannot clear it
+  private doorbellActive = false;
+  private doorbellClearTimer: NodeJS.Timeout | null = null;
+  // Monotonically increasing event id; mobile uses this to detect new rings
+  // even when the previous event hasn't been dismissed yet.
+  private doorbellEventId = 0;
 
   private currentLights: Record<string, boolean> = {
     'Living Room': false,
@@ -96,9 +97,67 @@ export class AppController implements OnModuleInit {
     });
     this.publishDeviceState();
     // Run periodic pump evaluation every 5 minutes
-    this.pumpEvalInterval = setInterval(() => {
-      this.evaluatePump().catch((e) => console.error('Pump evaluation failed:', e));
-    }, 5 * 60 * 1000);
+    this.pumpEvalInterval = setInterval(
+      () => {
+        this.evaluatePump().catch((e) =>
+          console.error('Pump evaluation failed:', e),
+        );
+      },
+      5 * 60 * 1000,
+    );
+
+    // Subscribe directly to MQTT (bypass NestJS wrapper format) for raw payloads
+    this.subscribeRawDoorbell();
+  }
+
+  private subscribeRawDoorbell() {
+    const url = process.env.MQTT_URL ?? 'mqtt://172.20.10.4:1883';
+    const client = mqtt.connect(url);
+
+    client.on('connect', () => {
+      console.log(`[MQTT] Connected to ${url}, subscribing to home/doorbell`);
+      client.subscribe('home/doorbell', (err) => {
+        if (err) console.error('[MQTT] Subscribe error:', err);
+      });
+    });
+
+    client.on('error', (err) => {
+      console.error('[MQTT] Connection error:', err);
+    });
+
+    client.on('message', (topic, payload) => {
+      if (topic !== 'home/doorbell') return;
+      this.handleDoorbell(payload.toString());
+    });
+  }
+
+  handleDoorbell(data: string) {
+    try {
+      const key = getEncryptionKeyFromEnv();
+      if (!key) {
+        console.error('DOORBELL_ENCRYPTION_KEY is missing or invalid');
+        return;
+      }
+
+      const decrypted = decryptDoorbellPayload(data, key);
+      const visitor = (decrypted.person as string) || 'Unknown';
+      this.lastVisitor = visitor;
+      this.doorbellActive = true;
+      this.doorbellEventId += 1;
+      console.log(
+        `[Doorbell] Visitor detected: ${visitor} (event #${this.doorbellEventId})`,
+      );
+
+      // Auto-clear after 60s so the popup doesn't re-fire forever
+      if (this.doorbellClearTimer) clearTimeout(this.doorbellClearTimer);
+      this.doorbellClearTimer = setTimeout(() => {
+        this.doorbellClearTimer = null;
+        this.doorbellActive = false;
+        this.lastVisitor = 'No one at the door';
+      }, 60 * 1000);
+    } catch (error) {
+      console.error('Decryption failed:', error);
+    }
   }
 
   // Evaluate pump state using latest sensor data and weather when in automatic mode
@@ -106,11 +165,15 @@ export class AppController implements OnModuleInit {
     if (this.manualPumpOverride) return; // do not override manual control
 
     try {
-      const latest = await this.sensorModel.findOne().sort({ timestamp: -1 }).exec();
+      const latest = await this.sensorModel
+        .findOne()
+        .sort({ timestamp: -1 })
+        .exec();
       const soil = latest?.soilMoisture;
-      
+
       if (typeof soil === 'number' && soil < 30) {
-        let isRaining = typeof latest?.isRaining === 'boolean' ? latest.isRaining : false;
+        let isRaining =
+          typeof latest?.isRaining === 'boolean' ? latest.isRaining : false;
 
         if (typeof latest?.isRaining !== 'boolean') {
           try {
@@ -147,23 +210,6 @@ export class AppController implements OnModuleInit {
     }
   }
 
-  @MessagePattern('home/doorbell')
-  handleDoorbell(@Payload() data: string) {
-    try {
-      const key = getEncryptionKeyFromEnv();
-      if (!key) {
-        console.error('DOORBELL_ENCRYPTION_KEY is missing or invalid');
-        return;
-      }
-
-      const decrypted = decryptDoorbellPayload(data, key);
-      this.lastVisitor = `${decrypted.person} is at the door`;
-      this.motionDetected = true;
-    } catch (error) {
-      console.error('Decryption failed:', error);
-    }
-  }
-
   @Post('update')
   async updateStatus(@Body() newData: SensorUpdateDto) {
     let pump = this.pumpState;
@@ -182,7 +228,9 @@ export class AppController implements OnModuleInit {
         try {
           this.mqttClient
             .emit('home/sensors/motion', '0')
-            .subscribe({ error: (e) => console.error('MQTT publish error:', e) });
+            .subscribe({
+              error: (e) => console.error('MQTT publish error:', e),
+            });
         } catch (e) {
           console.error('Error publishing motion clear to MQTT:', e);
         }
@@ -199,7 +247,8 @@ export class AppController implements OnModuleInit {
       typeof newData.soilMoisture === 'number' &&
       newData.soilMoisture < 30
     ) {
-      let isRaining = typeof newData.isRaining === 'boolean' ? newData.isRaining : false;
+      let isRaining =
+        typeof newData.isRaining === 'boolean' ? newData.isRaining : false;
 
       if (typeof newData.isRaining !== 'boolean') {
         try {
@@ -230,8 +279,8 @@ export class AppController implements OnModuleInit {
         typeof newData.soilMoisture === 'number' && newData.soilMoisture >= 30
           ? 'Soil Healthy'
           : this.manualPumpOverride
-          ? 'Manual Mode'
-          : 'No Action';
+            ? 'Manual Mode'
+            : 'No Action';
     }
 
     // store resulting pump state (but don't change manual override flag)
@@ -289,7 +338,11 @@ export class AppController implements OnModuleInit {
       .exec();
 
     const latestGasLevel = latest?.gasLevel ?? 0;
-    const latestMotion = latest?.motionDetected ?? this.motionDetected;
+    // Doorbell event takes precedence; fall back to PIR motion if no doorbell
+    const latestMotion =
+      this.doorbellActive ||
+      this.motionDetected ||
+      (latest?.motionDetected ?? false);
     const smokeDanger = latestGasLevel > 3000;
 
     return {
@@ -300,6 +353,7 @@ export class AppController implements OnModuleInit {
       isRaining: latest?.isRaining ?? false,
       motionDetected: latestMotion,
       lastVisitor: this.lastVisitor,
+      doorbellEventId: this.doorbellEventId,
       lights: this.currentLights,
       manualPump: this.manualPumpOverride,
       garageOpen: this.garageOpen,
@@ -324,8 +378,9 @@ export class AppController implements OnModuleInit {
 
   @Post('toggle-pump')
   togglePump(@Body() body: { state?: boolean }) {
-    const newState = typeof body.state === 'boolean' ? body.state : !this.pumpState;
-    
+    const newState =
+      typeof body.state === 'boolean' ? body.state : !this.pumpState;
+
     if (newState === true) {
       // User toggled ON -> enable manual override (pump under user control)
       this.pumpState = true;
@@ -340,7 +395,7 @@ export class AppController implements OnModuleInit {
         console.error('Pump evaluation failed:', err),
       );
     }
-    
+
     this.publishDeviceState();
     return {
       success: true,
@@ -373,7 +428,12 @@ export class AppController implements OnModuleInit {
       clearTimeout(this.motionClearTimer);
       this.motionClearTimer = null;
     }
+    if (this.doorbellClearTimer) {
+      clearTimeout(this.doorbellClearTimer);
+      this.doorbellClearTimer = null;
+    }
     this.motionDetected = false;
+    this.doorbellActive = false;
     this.lastVisitor = 'No one at the door';
     // publish cleared motion to MQTT so dashboard updates immediately
     try {

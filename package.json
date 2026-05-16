@@ -28,11 +28,12 @@
     "@nestjs/platform-express": "^11.0.1",
     "@types/nodemailer": "^8.0.0",
     "axios": "^1.14.0",
+    "dotenv": "^17.4.2",
+    "jsonwebtoken": "^9.0.0",
     "mongoose": "^9.3.1",
     "mqtt": "^5.15.1",
     "nodemailer": "^8.0.7",
     "reflect-metadata": "^0.2.2",
-    "jsonwebtoken": "^9.0.0",
     "rxjs": "^7.8.1"
   },
   "devDependencies": {
@@ -43,6 +44,7 @@
     "@nestjs/testing": "^11.0.1",
     "@types/express": "^5.0.0",
     "@types/jest": "^30.0.0",
+    "@types/jsonwebtoken": "^9.0.1",
     "@types/node": "^22.10.7",
     "@types/supertest": "^6.0.2",
     "eslint": "^9.18.0",
@@ -59,8 +61,6 @@
     "tsconfig-paths": "^4.2.0",
     "typescript": "^5.7.3",
     "typescript-eslint": "^8.20.0"
-  ,
-    "@types/jsonwebtoken": "^9.0.1"
   },
   "jest": {
     "moduleFileExtensions": [

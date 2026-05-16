@@ -1,14 +1,24 @@
 import * as crypto from 'crypto';
-import * as base64 from 'base64-js';
 
 /**
  * Decrypt a Fernet-encrypted doorbell payload from Raspberry Pi
  * Fernet uses AES-128 in CBC mode with HMAC-SHA256 verification
  */
-export function decryptDoorbellPayload(encryptedBase64: string, encryptionKey: Buffer): Record<string, any> {
+export function decryptDoorbellPayload(
+  encryptedBase64: string,
+  encryptionKey: Buffer,
+): Record<string, any> {
   try {
-    // Decode base64 string
-    const encryptedBytes = Buffer.from(encryptedBase64, 'base64');
+    // Fernet uses URL-safe base64 (with - and _); base64url decodes both correctly
+    let encryptedBytes = Buffer.from(encryptedBase64, 'base64url');
+
+    // Defensive: some senders accidentally base64-encode the Fernet token twice.
+    // A correct Fernet token starts with 0x80; if we see 'g' (0x67) it means the
+    // decoded bytes are STILL base64 text that needs another decode pass.
+    if (encryptedBytes[0] !== 0x80) {
+      const innerString = encryptedBytes.toString('utf-8');
+      encryptedBytes = Buffer.from(innerString, 'base64url');
+    }
 
     // Fernet format: [version (1 byte)][timestamp (8 bytes)][iv (16 bytes)][ciphertext][hmac (32 bytes)]
     if (encryptedBytes.length < 57) {
@@ -26,16 +36,23 @@ export function decryptDoorbellPayload(encryptedBase64: string, encryptionKey: B
     const ciphertext = encryptedBytes.slice(25, hmacStartIndex);
     const providedHmac = encryptedBytes.slice(hmacStartIndex);
 
-    // Verify HMAC
+    // Fernet key spec: first 16 bytes = HMAC signing key, last 16 bytes = AES key
+    const signingKey = encryptionKey.slice(0, 16);
+    const aesKey = encryptionKey.slice(16, 32);
+
+    // Verify HMAC using the signing key (first half)
     const verifiyData = encryptedBytes.slice(0, hmacStartIndex);
-    const computedHmac = crypto.createHmac('sha256', encryptionKey).update(verifiyData).digest();
+    const computedHmac = crypto
+      .createHmac('sha256', signingKey)
+      .update(verifiyData)
+      .digest();
 
     if (!crypto.timingSafeEqual(computedHmac, providedHmac)) {
       throw new Error('HMAC verification failed - payload may be tampered');
     }
 
-    // Decrypt using AES-128-CBC
-    const cipher = crypto.createDecipheriv('aes-128-cbc', encryptionKey.slice(0, 16), iv);
+    // Decrypt using AES-128-CBC with the encryption key (second half)
+    const cipher = crypto.createDecipheriv('aes-128-cbc', aesKey, iv);
     let decrypted = cipher.update(ciphertext);
     decrypted = Buffer.concat([decrypted, cipher.final()]);
 
@@ -62,7 +79,10 @@ export function getEncryptionKeyFromEnv(): Buffer | null {
     return Buffer.from(keyEnv, 'base64');
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error('Invalid DOORBELL_ENCRYPTION_KEY format (expected base64):', errorMessage);
+    console.error(
+      'Invalid DOORBELL_ENCRYPTION_KEY format (expected base64):',
+      errorMessage,
+    );
     return null;
   }
 }
