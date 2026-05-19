@@ -5,6 +5,14 @@ import { NestFactory } from '@nestjs/core';
 import { Transport, MicroserviceOptions } from '@nestjs/microservices';
 import { AppModule } from './app.module';
 import * as bodyParser from 'body-parser';
+import { NextFunction, Request, Response } from 'express';
+
+interface RawBodyRequest extends Request {
+  rawBody?: string;
+}
+
+const smartHomeHost = process.env.SMART_HOME_HOST ?? '172.20.10.4';
+const mqttUrl = process.env.MQTT_URL ?? `mqtt://${smartHomeHost}:1883`;
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -15,7 +23,7 @@ async function bootstrap() {
   // Connect MQTT microservice so @MessagePattern handlers receive Pi/ESP32 messages
   app.connectMicroservice<MicroserviceOptions>({
     transport: Transport.MQTT,
-    options: { url: process.env.MQTT_URL ?? 'mqtt://172.20.10.4:1883' },
+    options: { url: mqttUrl },
   });
   await app.startAllMicroservices();
 
@@ -25,10 +33,10 @@ async function bootstrap() {
   // 1b. Install body parsers with a verify hook so we can log raw bodies for debugging
   app.use(
     bodyParser.json({
-      verify: (req: any, _res, buf) => {
+      verify: (req: RawBodyRequest, _res, buf) => {
         try {
           req.rawBody = buf.toString();
-        } catch (_) {
+        } catch {
           req.rawBody = undefined;
         }
       },
@@ -37,10 +45,10 @@ async function bootstrap() {
   app.use(
     bodyParser.urlencoded({
       extended: true,
-      verify: (req: any, _res, buf) => {
+      verify: (req: RawBodyRequest, _res, buf) => {
         try {
           req.rawBody = buf.toString();
-        } catch (_) {
+        } catch {
           req.rawBody = undefined;
         }
       },
@@ -48,7 +56,7 @@ async function bootstrap() {
   );
 
   // 1c. Simple request logger to print raw bodies for debugging mobile POSTs
-  app.use((req: any, _res: any, next: any) => {
+  app.use((req: RawBodyRequest, _res: Response, next: NextFunction) => {
     console.log(
       `[REQ] ${req.method} ${req.url} rawBody=${
         req.rawBody ? req.rawBody : '<empty>'

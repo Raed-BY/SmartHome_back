@@ -7,10 +7,8 @@ export class Sensor extends Document {
   @Prop() tempSalon!: number;
   @Prop() soilMoisture!: number;
   @Prop() gasLevel!: number;
-  @Prop() isRaining!: boolean;
   @Prop() motionDetected!: boolean;
   @Prop() manualPump!: boolean;
-  @Prop({ default: false }) manualCanopy!: boolean;
   @Prop({ default: false }) garageOpen!: boolean;
   @Prop({ default: true }) proximityEnabled!: boolean;
   @Prop({

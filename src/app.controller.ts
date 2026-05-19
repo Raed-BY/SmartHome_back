@@ -18,6 +18,7 @@ import {
   decryptDoorbellPayload,
   getEncryptionKeyFromEnv,
 } from './doorbell.crypto';
+import { sendCivilProtectionAlert } from './alert.mailer';
 import { RfidCard } from './rfid-card.schema';
 import { User } from './user.schema';
 import { Sensor } from './sensor.schema';
@@ -43,7 +44,6 @@ interface SensorUpdateDto {
   soilMoisture?: number;
   gasLevel?: number;
   smokeLevel?: number;
-  isRaining?: boolean;
   motionDetected?: boolean;
   motion?: boolean;
 }
@@ -56,15 +56,21 @@ export class AppController implements OnModuleInit {
   })
   mqttClient!: ClientProxy;
 
+  // Raw MQTT client used for device commands — ClientProxy wraps payloads in
+  // JSON which the ESP32 cannot parse for simple "1"/"0"/"UNLOCK" strings.
+  private rawMqtt!: mqtt.MqttClient;
+
   private currentUserName = 'test';
   private pumpState = false;
   // When true, pumpState was set manually by the user and should not be overridden by automation
   private manualPumpOverride = false;
+  // When true, pump system is entirely disabled — neither manual nor auto can turn it on
+  private pumpSystemDisabled = false;
   private pumpEvalInterval: NodeJS.Timeout | null = null;
   private weatherReason = 'System Monitoring';
   private garageOpen = false;
+  // Motion state: real-time from MQTT (1 = ALERT, 0 = SAFE)
   private motionDetected = false;
-  private motionClearTimer: NodeJS.Timeout | null = null;
   private lastVisitor = 'No one at the door';
   // Doorbell event flag, INDEPENDENT of PIR motion so ESP32 updates cannot clear it
   private doorbellActive = false;
@@ -92,7 +98,6 @@ export class AppController implements OnModuleInit {
       tempSalon: 0,
       soilMoisture: 0,
       gasLevel: 0,
-      isRaining: false,
       motionDetected: false,
     });
     this.publishDeviceState();
@@ -106,29 +111,72 @@ export class AppController implements OnModuleInit {
       5 * 60 * 1000,
     );
 
-    // Subscribe directly to MQTT (bypass NestJS wrapper format) for raw payloads
-    this.subscribeRawDoorbell();
+    // Raw MQTT client: device commands + doorbell + RFID scan
+    this.setupRawMqtt();
   }
 
-  private subscribeRawDoorbell() {
+  private setupRawMqtt() {
     const url = process.env.MQTT_URL ?? 'mqtt://172.20.10.4:1883';
-    const client = mqtt.connect(url);
+    this.rawMqtt = mqtt.connect(url);
 
-    client.on('connect', () => {
-      console.log(`[MQTT] Connected to ${url}, subscribing to home/doorbell`);
-      client.subscribe('home/doorbell', (err) => {
-        if (err) console.error('[MQTT] Subscribe error:', err);
+    this.rawMqtt.on('connect', () => {
+      console.log(`[MQTT] raw client connected to ${url}`);
+      this.rawMqtt.subscribe('home/doorbell', (err) => {
+        if (err) console.error('[MQTT] doorbell subscribe error:', err);
+        else console.log('[MQTT] ✓ subscribed to home/doorbell');
       });
+      this.rawMqtt.subscribe('home/rfid/scan', (err) => {
+        if (err) console.error('[MQTT] rfid/scan subscribe error:', err);
+        else console.log('[MQTT] ✓ subscribed to home/rfid/scan');
+      });
+      this.rawMqtt.subscribe('home/sensors/motion', (err) => {
+        if (err) console.error('[MQTT] motion subscribe error:', err);
+        else console.log('[MQTT] ✓ subscribed to home/sensors/motion');
+      });
+      // Push current device state now that the connection is live
+      this.publishDeviceState();
     });
 
-    client.on('error', (err) => {
+    this.rawMqtt.on('error', (err) => {
       console.error('[MQTT] Connection error:', err);
     });
 
-    client.on('message', (topic, payload) => {
-      if (topic !== 'home/doorbell') return;
-      this.handleDoorbell(payload.toString());
+    this.rawMqtt.on('message', (topic, payload) => {
+      const msg = payload.toString().trim();
+      console.log(`[MQTT] message received: topic=${topic}, payload="${msg}"`);
+
+      if (topic === 'home/doorbell') {
+        this.handleDoorbell(msg);
+        return;
+      }
+      if (topic === 'home/rfid/scan') {
+        this.handleRfidScan(msg).catch((e) =>
+          console.error('[RFID] scan handler error:', e),
+        );
+        return;
+      }
+      if (topic === 'home/sensors/motion') {
+        this.motionDetected = msg === '1';
+        console.log(
+          `[MOTION] MQTT: "${msg}" → motionDetected=${this.motionDetected} → Status: ${this.motionDetected ? '🚨 ALERT' : '✓ SAFE'}`,
+        );
+      }
     });
+  }
+
+  private async handleRfidScan(uid: string) {
+    const upperUid = uid.trim().toUpperCase();
+    console.log(`[RFID] Scan received: ${upperUid}`);
+    const card = await this.rfidCardModel
+      .findOne({ uid: upperUid, active: true })
+      .exec();
+    if (card) {
+      console.log(`[RFID] Authorized: ${upperUid} (${card.ownerName})`);
+      this.rawMqtt.publish('home/commands', 'UNLOCK_DOOR');
+    } else {
+      console.log(`[RFID] Rejected: ${upperUid}`);
+      this.rawMqtt.publish('home/commands', 'REJECT_DOOR');
+    }
   }
 
   handleDoorbell(data: string) {
@@ -160,8 +208,89 @@ export class AppController implements OnModuleInit {
     }
   }
 
+  // Dual-API rain check: returns true only if BOTH OpenWeatherMap and Weatherbit report rain.
+  // If only one is available, falls back to that one. If neither, returns false (safe: water).
+  private async isRainingDualApi(): Promise<{
+    raining: boolean;
+    reason: string;
+  }> {
+    const city = process.env.WEATHER_CITY ?? 'Sousse';
+    const owmKey = process.env.OPENWEATHER_KEY;
+    const wbKey = process.env.WEATHERBIT_KEY;
+
+    let owmRain: boolean | null = null;
+    let wbRain: boolean | null = null;
+
+    // 4-second hard timeout per API so a slow service can't hang the whole server
+    const httpOpts = { timeout: 4000 };
+
+    if (owmKey) {
+      try {
+        const r = await firstValueFrom(
+          this.httpService.get<{ weather?: Array<{ main?: string }> }>(
+            `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${owmKey}`,
+            httpOpts,
+          ),
+        );
+        owmRain = r.data.weather?.[0]?.main === 'Rain';
+      } catch {
+        owmRain = null;
+      }
+    }
+
+    if (wbKey) {
+      try {
+        const r = await firstValueFrom(
+          this.httpService.get<{
+            data?: Array<{ weather?: { description?: string } }>;
+          }>(
+            `https://api.weatherbit.io/v2.0/current?city=${encodeURIComponent(city)}&key=${wbKey}`,
+            httpOpts,
+          ),
+        );
+        const desc =
+          r.data.data?.[0]?.weather?.description?.toLowerCase() ?? '';
+        wbRain = desc.includes('rain') || desc.includes('drizzle');
+      } catch {
+        wbRain = null;
+      }
+    }
+
+    // Decision: only skip watering if BOTH APIs (that responded) agree it's raining
+    if (owmRain === null && wbRain === null) {
+      return { raining: false, reason: 'Both weather APIs failed. Watering.' };
+    }
+    if (owmRain === null) {
+      return {
+        raining: !!wbRain,
+        reason: wbRain ? 'Weatherbit: rain. Skip.' : 'Weatherbit: dry. Water.',
+      };
+    }
+    if (wbRain === null) {
+      return {
+        raining: !!owmRain,
+        reason: owmRain
+          ? 'OpenWeather: rain. Skip.'
+          : 'OpenWeather: dry. Water.',
+      };
+    }
+    if (owmRain && wbRain) {
+      return { raining: true, reason: 'Both APIs confirm rain. Skip.' };
+    }
+    return {
+      raining: false,
+      reason: 'APIs disagree on rain. Watering (safe).',
+    };
+  }
+
   // Evaluate pump state using latest sensor data and weather when in automatic mode
   private async evaluatePump() {
+    if (this.pumpSystemDisabled) {
+      this.pumpState = false;
+      this.weatherReason = 'Pump System Disabled';
+      this.publishDeviceState();
+      return;
+    }
     if (this.manualPumpOverride) return; // do not override manual control
 
     try {
@@ -172,33 +301,9 @@ export class AppController implements OnModuleInit {
       const soil = latest?.soilMoisture;
 
       if (typeof soil === 'number' && soil < 30) {
-        let isRaining =
-          typeof latest?.isRaining === 'boolean' ? latest.isRaining : false;
-
-        if (typeof latest?.isRaining !== 'boolean') {
-          try {
-            const owmKey = '2c688507ce53db36534c86d0a2a690f5';
-            const weatherCity = process.env.WEATHER_CITY ?? 'Sousse';
-            const response = await firstValueFrom(
-              this.httpService.get<{ weather?: Array<{ main?: string }> }>(
-                `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(weatherCity)}&appid=${owmKey}`,
-              ),
-            );
-            isRaining = response.data.weather?.[0]?.main === 'Rain';
-          } catch (_e) {
-            // Safe fallback: if weather provider fails and soil is dry, water.
-            isRaining = false;
-            this.weatherReason = 'Weather API failed. Dry fallback.';
-          }
-        }
-
-        if (isRaining) {
-          this.pumpState = false;
-          this.weatherReason = 'Rain in Tunis. Skip.';
-        } else {
-          this.pumpState = true;
-          this.weatherReason = 'Dry Tunis. Watering.';
-        }
+        const { raining, reason } = await this.isRainingDualApi();
+        this.pumpState = !raining;
+        this.weatherReason = reason;
         this.publishDeviceState();
       } else if (typeof soil === 'number' && soil >= 30) {
         this.pumpState = false;
@@ -212,68 +317,40 @@ export class AppController implements OnModuleInit {
 
   @Post('update')
   async updateStatus(@Body() newData: SensorUpdateDto) {
+    console.log('[POST] /update received');
     let pump = this.pumpState;
     const gasLevel = newData.gasLevel ?? newData.smokeLevel;
     const motionDetected = newData.motionDetected ?? newData.motion ?? false;
-    this.motionDetected = motionDetected;
 
-    // If motion detected, schedule a clear after 60 seconds (reset to safe)
-    if (motionDetected) {
-      if (this.motionClearTimer) {
-        clearTimeout(this.motionClearTimer);
-      }
-      this.motionClearTimer = setTimeout(() => {
-        this.motionClearTimer = null;
-        this.motionDetected = false;
-        try {
-          this.mqttClient
-            .emit('home/sensors/motion', '0')
-            .subscribe({
-              error: (e) => console.error('MQTT publish error:', e),
-            });
-        } catch (e) {
-          console.error('Error publishing motion clear to MQTT:', e);
-        }
-      }, 60 * 1000);
-    } else {
-      if (this.motionClearTimer) {
-        clearTimeout(this.motionClearTimer);
-        this.motionClearTimer = null;
+    // Civil Protection email alert on gas/smoke (threshold 1200)
+    if (typeof gasLevel === 'number') {
+      const status = gasLevel > 1200 ? '🔥 FIRE DETECTED' : '✓ Normal';
+      console.log(`[SMOKE] Reading: ${gasLevel} (threshold: 1200) ${status}`);
+      if (gasLevel > 1200) {
+        console.log('[SMOKE] Sending alert email...');
+        sendCivilProtectionAlert('SMOKE', {
+          gasLevel,
+          temperature: newData.tempSalon,
+        }).catch((e) => console.error('[Mailer] alert send failed:', e));
       }
     }
 
+    // Motion state is now received via MQTT (no HTTP processing needed)
+    // Just store it for getStatus() to return
+
     if (
+      !this.pumpSystemDisabled &&
       !this.manualPumpOverride &&
       typeof newData.soilMoisture === 'number' &&
       newData.soilMoisture < 30
     ) {
-      let isRaining =
-        typeof newData.isRaining === 'boolean' ? newData.isRaining : false;
-
-      if (typeof newData.isRaining !== 'boolean') {
-        try {
-          const owmKey = '2c688507ce53db36534c86d0a2a690f5';
-          const weatherCity = process.env.WEATHER_CITY ?? 'Sousse';
-          const response = await firstValueFrom(
-            this.httpService.get<{ weather?: Array<{ main?: string }> }>(
-              `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(weatherCity)}&appid=${owmKey}`,
-            ),
-          );
-          isRaining = response.data.weather?.[0]?.main === 'Rain';
-        } catch (_e) {
-          // Safe fallback: if weather lookup fails while soil is dry, keep watering enabled.
-          isRaining = false;
-          this.weatherReason = 'Weather API failed. Dry fallback.';
-        }
-      }
-
-      if (isRaining) {
-        pump = false;
-        this.weatherReason = 'Rain in Tunis. Skip.';
-      } else {
-        pump = true;
-        this.weatherReason = 'Dry Tunis. Watering.';
-      }
+      // Use the shared dual-API rain check (with timeouts)
+      const { raining, reason } = await this.isRainingDualApi();
+      pump = !raining;
+      this.weatherReason = reason;
+    } else if (this.pumpSystemDisabled) {
+      pump = false;
+      this.weatherReason = 'Pump System Disabled';
     } else {
       this.weatherReason =
         typeof newData.soilMoisture === 'number' && newData.soilMoisture >= 30
@@ -338,24 +415,23 @@ export class AppController implements OnModuleInit {
       .exec();
 
     const latestGasLevel = latest?.gasLevel ?? 0;
-    // Doorbell event takes precedence; fall back to PIR motion if no doorbell
-    const latestMotion =
-      this.doorbellActive ||
-      this.motionDetected ||
-      (latest?.motionDetected ?? false);
-    const smokeDanger = latestGasLevel > 3000;
+
+    // Real-time motion status from MQTT: 1 = ALERT, 0 = SAFE
+    // Doorbell takes precedence
+    const latestMotion = this.doorbellActive || this.motionDetected;
+    const smokeDanger = latestGasLevel > 1200;
 
     return {
       tempSalon: latest?.tempSalon ?? 0,
       soilMoisture: latest?.soilMoisture ?? 0,
       gasLevel: latestGasLevel,
       smokeDanger,
-      isRaining: latest?.isRaining ?? false,
       motionDetected: latestMotion,
       lastVisitor: this.lastVisitor,
       doorbellEventId: this.doorbellEventId,
       lights: this.currentLights,
       manualPump: this.manualPumpOverride,
+      pumpSystemDisabled: this.pumpSystemDisabled,
       garageOpen: this.garageOpen,
       pump: this.pumpState,
       weatherReason: this.weatherReason,
@@ -377,23 +453,34 @@ export class AppController implements OnModuleInit {
   }
 
   @Post('toggle-pump')
-  togglePump(@Body() body: { state?: boolean }) {
+  async togglePump(@Body() body: { state?: boolean }) {
+    if (this.pumpSystemDisabled) {
+      // Whole pump system is disabled — manual toggles are no-ops
+      return {
+        success: false,
+        reason: 'Pump system is disabled. Enable it in Settings first.',
+        manualPump: false,
+        pump: false,
+        weatherReason: 'Pump System Disabled',
+      };
+    }
+
     const newState =
       typeof body.state === 'boolean' ? body.state : !this.pumpState;
 
     if (newState === true) {
-      // User toggled ON -> enable manual override (pump under user control)
-      this.pumpState = true;
+      // ON  -> manual mode, pump runs until user toggles off
       this.manualPumpOverride = true;
+      this.pumpState = true;
       this.weatherReason = 'Manual Mode: Pump ON';
+      console.log('[Pump] Manual ON');
     } else {
-      // User toggled OFF -> disable manual override and resume automatic mode
+      // OFF -> back to AUTOMATIC mode, run the dual-API rain check immediately
       this.manualPumpOverride = false;
-      this.pumpState = false;
-      this.weatherReason = 'Automatic Mode: Back to auto-control';
-      this.evaluatePump().catch((err) =>
-        console.error('Pump evaluation failed:', err),
+      console.log(
+        '[Pump] Switching to AUTOMATIC mode (dual weather API check)',
       );
+      await this.evaluatePump();
     }
 
     this.publishDeviceState();
@@ -401,6 +488,45 @@ export class AppController implements OnModuleInit {
       success: true,
       manualPump: this.manualPumpOverride,
       pump: this.pumpState,
+      weatherReason: this.weatherReason,
+    };
+  }
+
+  // Kill switch: disable the entire pump system (overrides both manual and automatic modes)
+  @Post('toggle-pump-system')
+  togglePumpSystem(@Body() body: { disabled?: boolean }) {
+    const newDisabled =
+      typeof body.disabled === 'boolean'
+        ? body.disabled
+        : !this.pumpSystemDisabled;
+
+    this.pumpSystemDisabled = newDisabled;
+
+    if (newDisabled) {
+      // Force pump off and clear manual override
+      this.pumpState = false;
+      this.manualPumpOverride = false;
+      this.weatherReason = 'Pump System Disabled';
+      console.log('[Pump] System DISABLED → pumpState=false, will publish "0"');
+    } else {
+      // Re-enabled — return to automatic mode and evaluate immediately
+      this.manualPumpOverride = false;
+      this.weatherReason = 'Automatic Mode: Re-enabled';
+      console.log('[Pump] System RE-ENABLED — switching to automatic mode');
+      this.evaluatePump().catch((e) =>
+        console.error('Pump evaluation failed:', e),
+      );
+    }
+
+    console.log(
+      `[Pump] publishDeviceState() called. disabled=${this.pumpSystemDisabled}`,
+    );
+    this.publishDeviceState();
+    return {
+      success: true,
+      pumpSystemDisabled: this.pumpSystemDisabled,
+      pump: this.pumpState,
+      manualPump: this.manualPumpOverride,
       weatherReason: this.weatherReason,
     };
   }
@@ -424,15 +550,12 @@ export class AppController implements OnModuleInit {
 
   @Post('reset-doorbell')
   reset() {
-    if (this.motionClearTimer) {
-      clearTimeout(this.motionClearTimer);
-      this.motionClearTimer = null;
-    }
+    // Clear motion and doorbell states (motion state still comes from MQTT)
+    this.motionDetected = false;
     if (this.doorbellClearTimer) {
       clearTimeout(this.doorbellClearTimer);
       this.doorbellClearTimer = null;
     }
-    this.motionDetected = false;
     this.doorbellActive = false;
     this.lastVisitor = 'No one at the door';
     // publish cleared motion to MQTT so dashboard updates immediately
@@ -547,8 +670,8 @@ export class AppController implements OnModuleInit {
   }
 
   private publishMqttCommand(command: string) {
-    this.mqttClient.emit('home/commands', command).subscribe({
-      error: (error) => console.error('MQTT publish failed:', error),
+    this.rawMqtt.publish('home/commands', command, (err) => {
+      if (err) console.error('MQTT publish failed:', err);
     });
   }
 
@@ -576,32 +699,26 @@ export class AppController implements OnModuleInit {
           .emit('home/sensors/motion', motionDetected ? '1' : '0')
           .subscribe({ error: (e) => console.error('MQTT publish error:', e) });
       }
-      if (typeof data.isRaining === 'boolean') {
-        this.mqttClient
-          .emit('home/sensors/rain', data.isRaining ? '1' : '0')
-          .subscribe({ error: (e) => console.error('MQTT publish error:', e) });
-      }
     } catch (error) {
       console.error('Error publishing sensor data to MQTT:', error);
     }
   }
 
   private publishDeviceState() {
-    try {
-      this.mqttClient
-        .emit('home/devices/pump', this.pumpState ? '1' : '0')
-        .subscribe({ error: (e) => console.error('MQTT publish error:', e) });
-      this.mqttClient
-        .emit('home/devices/garage', this.garageOpen ? '1' : '0')
-        .subscribe({ error: (e) => console.error('MQTT publish error:', e) });
-      Object.entries(this.currentLights).forEach(([room, state]) => {
-        const topic = `home/devices/light_${room.toUpperCase().replace(/ /g, '_')}`;
-        this.mqttClient
-          .emit(topic, state ? '1' : '0')
-          .subscribe({ error: (e) => console.error('MQTT publish error:', e) });
-      });
-    } catch (error) {
-      console.error('Error publishing device state to MQTT:', error);
-    }
+    // rawMqtt may not exist yet if called before setupRawMqtt() completes
+    if (!this.rawMqtt) return;
+
+    // MASTER LOCK: pumpSystemDisabled overrides everything
+    if (this.pumpSystemDisabled) this.pumpState = false;
+
+    const pumpPayload = this.pumpState ? '1' : '0';
+    console.log(`[PUMP] publish home/devices/pump = ${pumpPayload}`);
+
+    this.rawMqtt.publish('home/devices/pump', pumpPayload);
+    this.rawMqtt.publish('home/devices/garage', this.garageOpen ? '1' : '0');
+    Object.entries(this.currentLights).forEach(([room, state]) => {
+      const topic = `home/devices/light_${room.toUpperCase().replace(/ /g, '_')}`;
+      this.rawMqtt.publish(topic, state ? '1' : '0');
+    });
   }
 }
