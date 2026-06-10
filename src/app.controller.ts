@@ -322,11 +322,11 @@ export class AppController implements OnModuleInit {
     const gasLevel = newData.gasLevel ?? newData.smokeLevel;
     const motionDetected = newData.motionDetected ?? newData.motion ?? false;
 
-    // Civil Protection email alert on gas/smoke (threshold 1200)
+    // Civil Protection email alert on gas/smoke (threshold 2200)
     if (typeof gasLevel === 'number') {
-      const status = gasLevel > 1200 ? '🔥 FIRE DETECTED' : '✓ Normal';
-      console.log(`[SMOKE] Reading: ${gasLevel} (threshold: 1200) ${status}`);
-      if (gasLevel > 1200) {
+      const status = gasLevel > 2200 ? '🔥 FIRE DETECTED' : '✓ Normal';
+      console.log(`[SMOKE] Reading: ${gasLevel} (threshold: 2200) ${status}`);
+      if (gasLevel > 2200) {
         console.log('[SMOKE] Sending alert email...');
         sendCivilProtectionAlert('SMOKE', {
           gasLevel,
@@ -419,7 +419,7 @@ export class AppController implements OnModuleInit {
     // Real-time motion status from MQTT: 1 = ALERT, 0 = SAFE
     // Doorbell takes precedence
     const latestMotion = this.doorbellActive || this.motionDetected;
-    const smokeDanger = latestGasLevel > 1200;
+    const smokeDanger = latestGasLevel > 2200;
 
     return {
       tempSalon: latest?.tempSalon ?? 0,
