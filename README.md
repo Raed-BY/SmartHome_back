@@ -79,19 +79,8 @@ npm run test:cov
 
 ## Demo video
 
-If you want to show your project video on GitHub, the easiest options are:
+The demo video is stored in the mobile app repository. Watch it here:
 
-1. Upload the video to YouTube, Google Drive, or GitHub Releases and paste the link here.
-2. Store the video in the repository, for example `backend/assets/demo/demo.mp4`, then link to it with a relative path:
+[Watch the SmartHome demo](https://github.com/Raed-BY/SmartHome_mobile/blob/main/assets/demo/demo.mp4)
 
-```md
-[Watch the demo video](assets/demo/demo.mp4)
-```
-
-3. Add a thumbnail image in the README and make it clickable to the video link:
-
-```md
-[![SmartHome Demo](assets/demo/thumbnail.png)](assets/demo/demo.mp4)
-```
-
-If you want the video to play directly inside the README, the most reliable path is to link to a hosted video page like YouTube. GitHub README rendering is much better with links than with embedded local video players.
+The video is tracked with Git LFS in the mobile repository.
